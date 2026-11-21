@@ -2,6 +2,8 @@ import sys
 import os
 import json
 import hashlib
+import zlib
+import shutil
 import threading
 import time
 from pathlib import Path
@@ -32,16 +34,45 @@ from PySide6.QtGui import (
 COLOR_EXIST = QColor('#B5EAD7')   # 薄荷绿 - 都存在的文件
 COLOR_MISSING = QColor('#FFDAC1') # 蜜桃橙 - 缺少的文件
 COLOR_EXTRA = QColor('#FFB7CE')    # 樱花粉 - 多出的文件
+COLOR_MD5_MATCH = QColor('#A8E6CF')   # 翠绿 - MD5匹配
+COLOR_MD5_MISMATCH = QColor('#FFD3B6') # 杏色 - MD5不匹配
+
+
+class CompareAlgorithm(Enum):
+    """比对算法"""
+    BASIC = "基础比对(文件名/大小/时间)"
+    MD5 = "MD5指纹比对(更精确)"
+    SHA1 = "SHA1指纹比对"
+    SHA256 = "SHA256指纹比对"
+    CRC32 = "CRC32校验比对"
+
+
+class CompareMode(Enum):
+    """比较模式"""
+    ALL = "全部文件"
+    COMMON_ONLY = "只显示共同存在"
+    DIFF_ONLY = "只显示差异"
+    EXTRA_ONLY = "只显示多出的文件"
+    MISSING_ONLY = "只显示缺少的文件"
+    MD5_DIFF_ONLY = "只显示MD5差异"  # 新增：显示MD5不同的共同文件
+
+
+class DisplayMode(Enum):
+    """显示模式"""
+    GROUP = "分组显示"
+    FLAT = "平铺显示"
+    LIST = "列表显示"
+
 
 class ProjectInfo:
     """项目信息元数据（集中管理所有项目相关信息）"""
-    VERSION = "5.1.8"
-    BUILD_DATE = "2026-03-09"
+    VERSION = "6.1"
+    BUILD_DATE = "2026-08-20"
     AUTHOR = "杜玛"
     LICENSE = "GNU Affero General Public License v3.0"
     COPYRIGHT = "© 2026 杜玛。永久保留所有权利。"
     URL = "https://github.com/duma520"
-    MAINTAINER_EMAIL = "duma520@example.com"  # 示例邮箱，请替换为实际邮箱
+    MAINTAINER_EMAIL = "duma520@example.com"
     NAME = "多目录文件比对工具"
     DESCRIPTION = """多目录文件比对工具 - 高效、精准的目录比较解决方案
 
@@ -49,8 +80,14 @@ class ProjectInfo:
 • 快速扫描和比较两个目录的内容差异
 • 支持子目录递归比较
 • 多种显示模式：分组显示、平铺显示、列表显示
-• 灵活的过滤选项：共同存在、差异、多出、缺少
+• 灵活的过滤选项：共同存在、差异、多出、缺少、MD5差异
 • 文件大小和修改时间对比
+• 多种哈希校验：MD5 / SHA1 / SHA256 / CRC32
+• 一键同步功能（复制缺失/更新差异/删除多余）
+• 比较报告导出（HTML / CSV / TXT）
+• 文件内容对比查看（文本/十六进制）
+• 统计信息面板（各分组数量与大小）
+• 设置实时自动保存（下次启动沿用上次设置）
 • 历史记录功能，快速访问常用目录
 • 支持拖拽目录到输入框
 • 右键菜单快速操作文件
@@ -65,7 +102,11 @@ class ProjectInfo:
         "4.0.0": "添加历史记录和设置保存功能",
         "5.0.0": "优化界面，增加右键菜单",
         "5.1.0": "增加共同存在过滤选项",
-        "5.1.1": "优化性能和修复已知问题"
+        "5.1.1": "优化性能和修复已知问题",
+        "5.2.0": "新增MD5指纹比对功能",
+        "5.2.1": "新增'只显示MD5差异'过滤选项",
+        "6.0.0": "大版本升级：一键同步、报告导出、SHA1/SHA256/CRC32多哈希、文件内容对比、统计面板",
+        "6.1.0": "设置实时自动保存（控件变更即自动持久化、窗口最大化状态恢复）；维护约定落地（软件升级迭代记录.md + version 备份）"
     }
     
     HELP_TEXT = """<h2>多目录文件比对工具 - 使用指南</h2>
@@ -73,25 +114,35 @@ class ProjectInfo:
 <h3>基本操作步骤：</h3>
 <ol>
     <li><b>选择目录</b>：点击"浏览"按钮或直接粘贴路径到输入框</li>
+    <li><b>选择比对算法</b>：基础比对 或 MD5/SHA1/SHA256/CRC32 哈希比对</li>
     <li><b>开始比较</b>：点击工具栏的"开始比较"按钮或按F5键</li>
     <li><b>查看结果</b>：比较完成后，结果会以彩色方式显示</li>
     <li><b>过滤结果</b>：使用"比较模式"下拉框筛选显示内容</li>
 </ol>
 
+<h3>比对模式说明：</h3>
+<ul>
+    <li><b>基础比对</b>：基于文件名、文件大小和修改时间进行比对，速度快</li>
+    <li><b>MD5/SHA1/SHA256/CRC32 哈希比对</b>：基于文件内容的哈希值进行比对，更精确但速度较慢。CRC32 速度最快，SHA256 安全性最高</li>
+</ul>
+
 <h3>颜色标识：</h3>
 <ul>
-    <li><span style='background-color: #B5EAD7'>薄荷绿</span> - 两个目录都存在的文件</li>
+    <li><span style='background-color: #B5EAD7'>薄荷绿</span> - 两个目录都存在的文件（基础比对）</li>
     <li><span style='background-color: #FFDAC1'>蜜桃橙</span> - 目录2中缺少的文件</li>
     <li><span style='background-color: #FFB7CE'>樱花粉</span> - 目录1中多出的文件</li>
+    <li><span style='background-color: #A8E6CF'>翠绿</span> - 哈希匹配的文件</li>
+    <li><span style='background-color: #FFD3B6'>杏色</span> - 哈希不匹配的文件</li>
 </ul>
 
 <h3>比较模式说明：</h3>
 <ul>
     <li><b>全部文件</b> - 显示所有文件和目录</li>
     <li><b>只显示共同存在</b> - 仅显示两个目录都有的项目</li>
-    <li><b>只显示差异</b> - 仅显示存在差异的项目</li>
+    <li><b>只显示差异</b> - 仅显示存在差异的项目（包括一边有另一边没有，以及哈希不匹配的情况）</li>
     <li><b>只显示多出的文件</b> - 仅显示目录1有而目录2没有的项目</li>
     <li><b>只显示缺少的文件</b> - 仅显示目录2有而目录1没有的项目</li>
+    <li><b>只显示MD5差异</b> - 仅显示两个目录都存在但哈希值不同的文件（需配合哈希比对模式）</li>
 </ul>
 
 <h3>显示模式：</h3>
@@ -101,12 +152,33 @@ class ProjectInfo:
     <li><b>列表显示</b> - 简洁列表形式</li>
 </ul>
 
+<h3>一键同步（v6.0 新增）：</h3>
+<ul>
+    <li>比较完成后，点击工具栏的<b>"同步"</b>按钮打开同步对话框</li>
+    <li>选择<b>源目录</b>（目录1→目录2 或 目录2→目录1）</li>
+    <li>可勾选：复制缺失文件、覆盖内容不同文件、删除目标目录多余文件（危险操作）</li>
+    <li>同步过程实时显示进度，完成后展示操作统计</li>
+</ul>
+
+<h3>报告导出（v6.0 新增）：</h3>
+<ul>
+    <li>点击工具栏的<b>"导出"</b>按钮，可将比较结果导出为 <b>HTML 报告 / CSV / 文本</b></li>
+    <li>HTML 报告带彩色标识，适合归档和分享</li>
+</ul>
+
+<h3>文件内容对比（v6.0 新增）：</h3>
+<ul>
+    <li>右键点击共同存在的文件，选择<b>"比较内容"</b>可查看两侧文件差异</li>
+    <li>支持 <b>文本视图</b> 与 <b>十六进制视图</b> 两种显示方式</li>
+</ul>
+
 <h3>右键菜单功能：</h3>
 <ul>
     <li><b>打开文件位置</b> - 在资源管理器中打开文件所在目录</li>
     <li><b>复制路径</b> - 复制文件的相对路径到剪贴板</li>
     <li><b>复制文件名</b> - 复制文件名到剪贴板</li>
-    <li><b>比较内容</b> - 对文件进行内容比较（需额外配置）</li>
+    <li><b>计算哈希值</b> - 计算选中文件的哈希值（哈希模式下可用）</li>
+    <li><b>比较内容</b> - 查看两个目录中该文件的内容差异</li>
     <li><b>刷新</b> - 重新比较当前选中的项目</li>
 </ul>
 
@@ -123,19 +195,19 @@ class ProjectInfo:
     <li>可以直接从文件夹拖拽目录到输入框</li>
     <li>双击目录输入框可以快速打开目录选择对话框</li>
     <li>使用"交换目录"按钮快速切换两个目录的位置</li>
+    <li>哈希比对适用于需要精确确认文件内容是否一致的场景</li>
+    <li>"只显示MD5差异"模式可以快速找出内容不同但文件名相同的文件</li>
     <li>历史记录会自动保存最近使用的20个目录</li>
-    <li>程序会自动保存窗口位置和显示设置</li>
 </ul>
 
 <h3>注意事项：</h3>
 <ul>
+    <li>哈希比对会读取所有文件内容，大文件时速度较慢</li>
     <li>比较大量文件时请耐心等待，可使用"停止"按钮取消操作</li>
     <li>目录权限不足可能导致某些文件无法访问</li>
-    <li>符号链接会被当作普通文件处理</li>
-    <li>建议在使用前关闭不必要的程序以释放系统资源</li>
+    <li>"只显示MD5差异"模式只在哈希比对模式下有效</li>
+    <li>「删除目标目录中多余的文件」为危险操作，同步前请确认备份</li>
 </ul>
-
-<p><i>如有问题或建议，请联系：duma520@example.com</i></p>
 """
 
     @classmethod
@@ -172,12 +244,19 @@ class ProjectInfo:
                 "递归子目录比较",
                 "多种显示和过滤模式",
                 "文件大小和修改时间对比",
+                "MD5指纹比对功能",
+                "SHA1/SHA256/CRC32多哈希",
+                "只显示MD5差异过滤",
+                "一键同步目录",
+                "导出HTML/CSV/TXT报告",
+                "文件内容对比查看",
+                "统计信息面板",
+                "设置实时自动保存",
                 "彩色标识文件状态",
                 "历史记录功能",
                 "拖拽支持",
                 "右键菜单快速操作",
-                "多线程扫描不卡顿",
-                "设置自动保存"
+                "多线程扫描不卡顿"
             ]
         }
 
@@ -354,7 +433,7 @@ class HelpDialog(QDialog):
         guide_layout = QVBoxLayout(guide_widget)
         
         guide_text = QTextBrowser()
-        guide_text.setOpenExternalLinks(True)  # 允许打开外部链接
+        guide_text.setOpenExternalLinks(True)
         guide_text.setHtml(ProjectInfo.HELP_TEXT)
         guide_layout.addWidget(guide_text)
         
@@ -365,7 +444,7 @@ class HelpDialog(QDialog):
         shortcut_layout = QVBoxLayout(shortcut_widget)
         
         shortcut_text = QTextBrowser()
-        shortcut_text.setOpenExternalLinks(True)  # 允许打开外部链接
+        shortcut_text.setOpenExternalLinks(True)
         shortcut_text.setHtml("""
         <h2>快捷键列表</h2>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%;">
@@ -420,7 +499,7 @@ class HelpDialog(QDialog):
         about_layout = QVBoxLayout(about_widget)
         
         about_text = QTextBrowser()
-        about_text.setOpenExternalLinks(True)  # 允许打开外部链接
+        about_text.setOpenExternalLinks(True)
         info = ProjectInfo.get_about_info()
         about_html = f"""
         <h2>{info['name']}</h2>
@@ -471,33 +550,17 @@ class HelpDialog(QDialog):
         self.setLayout(layout)
 
 
-
-
-class CompareMode(Enum):
-    """比较模式"""
-    ALL = "全部文件"
-    COMMON_ONLY = "只显示共同存在"  # 新增
-    DIFF_ONLY = "只显示差异"
-    EXTRA_ONLY = "只显示多出的文件"
-    MISSING_ONLY = "只显示缺少的文件"
-
-
-class DisplayMode(Enum):
-    """显示模式"""
-    GROUP = "分组显示"
-    FLAT = "平铺显示"
-    LIST = "列表显示"
-
-
 class FileInfo:
     """文件信息类"""
-    def __init__(self, path: str, rel_path: str):
+    def __init__(self, path: str, rel_path: str, hash_type: str = "MD5"):
         self.path = path
         self.rel_path = rel_path
         self.name = os.path.basename(path)
         self.is_dir = os.path.isdir(path)
         self.size = 0
         self.mod_time = 0
+        self.md5 = None  # 哈希值（MD5/SHA1/SHA256/CRC32）
+        self.hash_type = hash_type
         self.exists = os.path.exists(path)
         
         if self.exists and not self.is_dir:
@@ -506,18 +569,57 @@ class FileInfo:
                 self.mod_time = os.path.getmtime(path)
             except:
                 pass
+    
+    def calculate_md5(self, progress_callback=None) -> Optional[str]:
+        """计算文件的MD5值（兼容旧调用）"""
+        return self.calculate_hash(progress_callback)
+    
+    def calculate_hash(self, progress_callback=None) -> Optional[str]:
+        """计算文件的哈希值（MD5/SHA1/SHA256/CRC32）"""
+        if self.is_dir or not self.exists:
+            return None
+        
+        try:
+            if self.hash_type == "CRC32":
+                crc = 0
+                with open(self.path, "rb") as f:
+                    for chunk in iter(lambda: f.read(8192), b""):
+                        crc = zlib.crc32(chunk, crc)
+                        if progress_callback:
+                            progress_callback()
+                self.md5 = format(crc & 0xFFFFFFFF, '08x')
+                return self.md5
+            
+            hash_obj = {
+                "MD5": hashlib.md5,
+                "SHA1": hashlib.sha1,
+                "SHA256": hashlib.sha256,
+            }.get(self.hash_type, hashlib.md5)()
+            with open(self.path, "rb") as f:
+                # 分块读取，避免大文件内存问题
+                for chunk in iter(lambda: f.read(8192), b""):
+                    hash_obj.update(chunk)
+                    if progress_callback:
+                        progress_callback()
+            self.md5 = hash_obj.hexdigest()
+            return self.md5
+        except Exception as e:
+            print(f"计算{self.hash_type}失败 {self.path}: {e}")
+            return None
 
 
 class ScanThread(QThread):
     """扫描线程"""
-    progress = Signal(int, str)  # 进度值，状态信息
-    finished = Signal(dict)  # 扫描结果
-    error = Signal(str)  # 错误信息
+    progress = Signal(int, str)
+    finished = Signal(dict)
+    error = Signal(str)
     
-    def __init__(self, dir1: str, dir2: str):
+    def __init__(self, dir1: str, dir2: str, use_md5: bool = False, hash_type: str = "MD5"):
         super().__init__()
         self.dir1 = dir1
         self.dir2 = dir2
+        self.use_md5 = use_md5
+        self.hash_type = hash_type if hash_type else "MD5"
         self.is_cancelled = False
         self.mutex = QMutex()
         
@@ -539,28 +641,54 @@ class ScanThread(QThread):
                 self.progress.emit(0, f"正在扫描目录1: {self.dir1}")
                 files1 = self.scan_directory(self.dir1)
                 result['files1'] = files1
-                
-            # 检查是否取消
+            
             if self.is_cancelled:
                 return
-                
+            
             # 扫描第二个目录
             if self.dir2:
                 self.progress.emit(50, f"正在扫描目录2: {self.dir2}")
                 files2 = self.scan_directory(self.dir2)
                 result['files2'] = files2
+            
+            # 如果需要MD5比对，计算所有文件的哈希值
+            if self.use_md5 and not self.is_cancelled:
+                self.progress.emit(60, f"正在计算{self.hash_type}值(目录1)...")
+                self.calculate_all_md5(result['files1'], "目录1")
                 
+                if self.is_cancelled:
+                    return
+                    
+                self.progress.emit(80, f"正在计算{self.hash_type}值(目录2)...")
+                self.calculate_all_md5(result['files2'], "目录2")
+            
             self.progress.emit(100, "扫描完成")
             self.finished.emit(result)
             
         except Exception as e:
             self.error.emit(str(e))
+    
+    def calculate_all_md5(self, files_dict: Dict[str, FileInfo], dir_name: str):
+        """计算所有文件的哈希值"""
+        files = [f for f in files_dict.values() if not f.is_dir]
+        total = len(files)
+        processed = 0
+        
+        for file_info in files:
+            if self.is_cancelled:
+                break
             
+            file_info.calculate_hash()
+            processed += 1
+            
+            if processed % 10 == 0:
+                progress = 60 + int(processed * 20 / total) if dir_name == "目录1" else 80 + int(processed * 20 / total)
+                self.progress.emit(progress, f"正在计算{dir_name}{self.hash_type}: {processed}/{total}")
+    
     def scan_directory(self, root_path: str) -> Dict[str, FileInfo]:
         """扫描目录"""
         result = {}
         try:
-            all_files = []
             for root, dirs, files in os.walk(root_path):
                 # 检查是否取消
                 self.mutex.lock()
@@ -576,35 +704,37 @@ class ScanThread(QThread):
                         rel_path = os.path.relpath(full_path, root_path)
                         if rel_path == '.':
                             continue
-                        result[rel_path] = FileInfo(full_path, rel_path)
+                        result[rel_path] = FileInfo(full_path, rel_path, self.hash_type)
                     except Exception as e:
-                        result['errors'].append(f"处理目录出错: {str(e)}")
+                        print(f"处理目录出错: {e}")
                         
                 # 处理文件
                 for file_name in files:
                     try:
                         full_path = os.path.join(root, file_name)
                         rel_path = os.path.relpath(full_path, root_path)
-                        result[rel_path] = FileInfo(full_path, rel_path)
+                        result[rel_path] = FileInfo(full_path, rel_path, self.hash_type)
                     except Exception as e:
-                        result['errors'].append(f"处理文件出错: {str(e)}")
+                        print(f"处理文件出错: {e}")
                         
         except Exception as e:
-            result['errors'].append(f"扫描目录出错: {str(e)}")
+            print(f"扫描目录出错: {e}")
             
         return result
 
 
 class CompareThread(QThread):
     """比较线程"""
-    progress = Signal(int, str)  # 进度值，状态信息
-    finished = Signal(list)  # 比较结果
+    progress = Signal(int, str)
+    finished = Signal(list)
     error = Signal(str)
     
-    def __init__(self, files1: Dict, files2: Dict):
+    def __init__(self, files1: Dict, files2: Dict, use_md5: bool = False, hash_type: str = "MD5"):
         super().__init__()
         self.files1 = files1
         self.files2 = files2
+        self.use_md5 = use_md5
+        self.hash_type = hash_type if hash_type else "MD5"
         self.is_cancelled = False
         self.mutex = QMutex()
         
@@ -631,6 +761,9 @@ class CompareThread(QThread):
                 file1 = self.files1.get(rel_path)
                 file2 = self.files2.get(rel_path)
                 
+                # 判断文件是否相同
+                is_same = self.is_same_file(file1, file2)
+                
                 item = {
                     'rel_path': rel_path,
                     'name': os.path.basename(rel_path),
@@ -640,7 +773,10 @@ class CompareThread(QThread):
                     'size1': file1.size if file1 else 0,
                     'size2': file2.size if file2 else 0,
                     'time1': file1.mod_time if file1 else 0,
-                    'time2': file2.mod_time if file2 else 0
+                    'time2': file2.mod_time if file2 else 0,
+                    'is_same': is_same,  # 新增：是否相同
+                    'md5_1': file1.md5 if file1 and file1.md5 else None,
+                    'md5_2': file2.md5 if file2 and file2.md5 else None
                 }
                 
                 result.append(item)
@@ -657,6 +793,26 @@ class CompareThread(QThread):
             
         except Exception as e:
             self.error.emit(str(e))
+    
+    def is_same_file(self, file1: Optional[FileInfo], file2: Optional[FileInfo]) -> bool:
+        """判断两个文件是否相同"""
+        if file1 is None or file2 is None:
+            return False
+        
+        # 如果是目录，只比较名称
+        if file1.is_dir or file2.is_dir:
+            return file1.name == file2.name
+        
+        # 如果使用MD5比对
+        if self.use_md5:
+            if file1.md5 is not None and file2.md5 is not None:
+                return file1.md5 == file2.md5
+            else:
+                # 如果MD5计算失败，回退到基础比对
+                return file1.size == file2.size and file1.mod_time == file2.mod_time
+        
+        # 基础比对：大小和修改时间
+        return file1.size == file2.size and file1.mod_time == file2.mod_time
 
 
 class HistoryDialog(QDialog):
@@ -695,6 +851,315 @@ class HistoryDialog(QDialog):
         return item.text() if item else ""
 
 
+class SyncThread(QThread):
+    """同步线程"""
+    progress = Signal(int, str)
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(self, src_dir: str, dst_dir: str, results: list,
+                 reverse: bool = False, copy_missing: bool = True,
+                 copy_diff: bool = True, delete_extra: bool = False):
+        super().__init__()
+        self.src_dir = src_dir
+        self.dst_dir = dst_dir
+        self.results = results
+        self.reverse = reverse
+        self.copy_missing = copy_missing
+        self.copy_diff = copy_diff
+        self.delete_extra = delete_extra
+        self.is_cancelled = False
+        self.mutex = QMutex()
+
+    def cancel(self):
+        self.mutex.lock()
+        self.is_cancelled = True
+        self.mutex.unlock()
+
+    def run(self):
+        try:
+            summary = {'copied': 0, 'updated': 0, 'deleted': 0, 'failed': 0, 'failed_list': []}
+            if self.reverse:
+                src_flag, dst_flag = 'in_dir2', 'in_dir1'
+            else:
+                src_flag, dst_flag = 'in_dir1', 'in_dir2'
+
+            total = len(self.results)
+            processed = 0
+
+            for item in self.results:
+                self.mutex.lock()
+                if self.is_cancelled:
+                    self.mutex.unlock()
+                    break
+                self.mutex.unlock()
+
+                rel = item.get('rel_path', '')
+                src_exists = item.get(src_flag, False)
+                dst_exists = item.get(dst_flag, False)
+                is_same = item.get('is_same', True)
+                is_dir = item.get('is_dir', False)
+
+                src_path = os.path.join(self.src_dir, rel)
+                dst_path = os.path.join(self.dst_dir, rel)
+
+                try:
+                    if src_exists and not dst_exists:
+                        if self.copy_missing:
+                            self._copy(src_path, dst_path, is_dir)
+                            summary['copied'] += 1
+                    elif src_exists and dst_exists and not is_same:
+                        if self.copy_diff:
+                            self._copy(src_path, dst_path, is_dir)
+                            summary['updated'] += 1
+                    elif not src_exists and dst_exists:
+                        if self.delete_extra:
+                            self._delete(dst_path, is_dir)
+                            summary['deleted'] += 1
+                except Exception as e:
+                    summary['failed'] += 1
+                    summary['failed_list'].append((rel, str(e)))
+
+                processed += 1
+                if processed % 20 == 0:
+                    self.progress.emit(
+                        int(processed * 100 / total) if total else 100,
+                        f"正在同步: {processed}/{total}"
+                    )
+
+            self.progress.emit(100, "同步完成")
+            self.finished.emit(summary)
+
+        except Exception as e:
+            self.error.emit(str(e))
+
+    def _copy(self, src_path: str, dst_path: str, is_dir: bool):
+        """复制文件或创建目录"""
+        if is_dir:
+            if not os.path.exists(dst_path):
+                os.makedirs(dst_path, exist_ok=True)
+            return
+        dst_dir = os.path.dirname(dst_path)
+        if dst_dir and not os.path.exists(dst_dir):
+            os.makedirs(dst_dir, exist_ok=True)
+        if os.path.exists(src_path) and os.path.isfile(src_path):
+            shutil.copy2(src_path, dst_path)
+
+    def _delete(self, dst_path: str, is_dir: bool):
+        """删除文件或目录"""
+        if not os.path.exists(dst_path):
+            return
+        if is_dir:
+            shutil.rmtree(dst_path, ignore_errors=True)
+        else:
+            os.remove(dst_path)
+
+
+class SyncDialog(QDialog):
+    """一键同步对话框"""
+    def __init__(self, parent, dir1: str, dir2: str, results: list):
+        super().__init__(parent)
+        self.setWindowTitle("一键同步")
+        self.setMinimumSize(560, 360)
+        self.dir1 = dir1
+        self.dir2 = dir2
+        self.results = results
+        self.sync_thread = None
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # 同步方向
+        dir_group = QGroupBox("同步方向")
+        gl = QHBoxLayout(dir_group)
+        gl.addWidget(QLabel("源目录:"))
+        self.src_combo = QComboBox()
+        self.src_combo.addItem(f"目录1: {self.dir1}")
+        self.src_combo.addItem(f"目录2: {self.dir2}")
+        gl.addWidget(self.src_combo, 1)
+        layout.addWidget(dir_group)
+
+        # 同步选项
+        opt_group = QGroupBox("同步选项")
+        ol = QVBoxLayout(opt_group)
+        self.copy_missing_check = QCheckBox("复制源目录中有、目标目录中缺失的文件")
+        self.copy_missing_check.setChecked(True)
+        self.copy_diff_check = QCheckBox("覆盖内容不同的文件（大小/时间/哈希不同）")
+        self.copy_diff_check.setChecked(True)
+        self.delete_extra_check = QCheckBox("删除目标目录中多余的文件（⚠ 危险操作，请谨慎）")
+        self.delete_extra_check.setChecked(False)
+        ol.addWidget(self.copy_missing_check)
+        ol.addWidget(self.copy_diff_check)
+        ol.addWidget(self.delete_extra_check)
+        layout.addWidget(opt_group)
+
+        # 进度与状态
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar)
+        self.status_label = QLabel("就绪")
+        layout.addWidget(self.status_label)
+
+        # 按钮
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        self.start_btn = QPushButton("开始同步")
+        self.start_btn.setMinimumWidth(120)
+        self.start_btn.clicked.connect(self.start_sync)
+        self.close_btn = QPushButton("关闭")
+        self.close_btn.setMinimumWidth(100)
+        self.close_btn.clicked.connect(self.close)
+        btn_layout.addWidget(self.start_btn)
+        btn_layout.addWidget(self.close_btn)
+        layout.addLayout(btn_layout)
+
+    def start_sync(self):
+        if self.sync_thread and self.sync_thread.isRunning():
+            self.sync_thread.cancel()
+            self.start_btn.setText("开始同步")
+            return
+
+        reverse = self.src_combo.currentIndex() == 1
+        if reverse:
+            src, dst = self.dir2, self.dir1
+        else:
+            src, dst = self.dir1, self.dir2
+
+        self.sync_thread = SyncThread(
+            src, dst, self.results, reverse=reverse,
+            copy_missing=self.copy_missing_check.isChecked(),
+            copy_diff=self.copy_diff_check.isChecked(),
+            delete_extra=self.delete_extra_check.isChecked(),
+        )
+        self.sync_thread.progress.connect(self._on_sync_progress)
+        self.sync_thread.finished.connect(self._on_sync_finished)
+        self.sync_thread.error.connect(self._on_sync_error)
+        self.start_btn.setText("取消同步")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.status_label.setText("正在同步...")
+        self.sync_thread.start()
+
+    def _on_sync_progress(self, value: int, message: str):
+        self.progress_bar.setValue(value)
+        self.status_label.setText(message)
+
+    def _on_sync_finished(self, summary: dict):
+        self.start_btn.setText("开始同步")
+        copied = summary.get('copied', 0)
+        updated = summary.get('updated', 0)
+        deleted = summary.get('deleted', 0)
+        failed = summary.get('failed', 0)
+        self.status_label.setText(
+            f"同步完成: 复制 {copied} 个, 覆盖更新 {updated} 个, 删除 {deleted} 个, 失败 {failed} 个"
+        )
+        msg = (f"同步完成！\n\n"
+               f"复制缺失文件: {copied} 个\n"
+               f"覆盖更新文件: {updated} 个\n"
+               f"删除多余文件: {deleted} 个\n"
+               f"失败: {failed} 个")
+        if failed and summary.get('failed_list'):
+            msg += "\n\n失败明细:\n" + "\n".join(f"  {r}: {e}" for r, e in summary['failed_list'][:10])
+        QMessageBox.information(self, "同步完成", msg)
+
+    def _on_sync_error(self, error_msg: str):
+        self.start_btn.setText("开始同步")
+        self.status_label.setText("同步失败")
+        QMessageBox.critical(self, "同步失败", error_msg)
+
+    def closeEvent(self, event):
+        if self.sync_thread and self.sync_thread.isRunning():
+            self.sync_thread.cancel()
+            self.sync_thread.wait()
+        event.accept()
+
+
+class FileCompareDialog(QDialog):
+    """文件内容对比对话框"""
+    def __init__(self, path1: str, path2: str, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("文件内容对比")
+        self.resize(900, 600)
+        self.path1 = path1
+        self.path2 = path2
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(6)
+
+        # 文件信息
+        info1 = QLabel(f"左侧: {os.path.basename(self.path1)}\n{self.path1}")
+        info1.setStyleSheet("color: #2c3e50; padding: 4px; background: #f8f9fa; border-radius: 4px;")
+        info2 = QLabel(f"右侧: {os.path.basename(self.path2)}\n{self.path2}")
+        info2.setStyleSheet("color: #2c3e50; padding: 4px; background: #f8f9fa; border-radius: 4px;")
+
+        top = QHBoxLayout()
+        top.addWidget(info1)
+        top.addWidget(info2)
+        layout.addLayout(top)
+
+        splitter = QSplitter(Qt.Horizontal)
+        self.edit1 = QTextEdit()
+        self.edit2 = QTextEdit()
+        self.edit1.setReadOnly(True)
+        self.edit2.setReadOnly(True)
+        self.edit1.setLineWrapMode(QTextEdit.NoWrap)
+        self.edit2.setLineWrapMode(QTextEdit.NoWrap)
+        self.edit1.setFont(QFont("Consolas", 10))
+        self.edit2.setFont(QFont("Consolas", 10))
+        splitter.addWidget(self.edit1)
+        splitter.addWidget(self.edit2)
+        splitter.setSizes([450, 450])
+        layout.addWidget(splitter, 1)
+
+        # 视图切换
+        view_layout = QHBoxLayout()
+        view_layout.addStretch()
+        self.view_combo = QComboBox()
+        self.view_combo.addItem("文本视图")
+        self.view_combo.addItem("十六进制视图")
+        self.view_combo.currentIndexChanged.connect(self.load_content)
+        view_layout.addWidget(QLabel("显示方式:"))
+        view_layout.addWidget(self.view_combo)
+        layout.addLayout(view_layout)
+
+        self.load_content()
+
+    def load_content(self):
+        hex_mode = self.view_combo.currentIndex() == 1
+        for edit, path in [(self.edit1, self.path1), (self.edit2, self.path2)]:
+            try:
+                with open(path, 'rb') as f:
+                    raw = f.read()
+                if hex_mode:
+                    edit.setPlainText(self._to_hexdump(raw))
+                else:
+                    try:
+                        text = raw.decode('utf-8')
+                    except UnicodeDecodeError:
+                        text = raw.decode('gbk', errors='replace')
+                    if b'\x00' in raw[:8192]:
+                        text = f"[检测到二进制内容，建议使用十六进制视图查看]\n\n{text}"
+                    edit.setPlainText(text)
+            except Exception as e:
+                edit.setPlainText(f"无法读取文件: {e}")
+
+    @staticmethod
+    def _to_hexdump(data: bytes, width: int = 16) -> str:
+        """将字节数据转换为十六进制视图"""
+        lines = []
+        for i in range(0, len(data), width):
+            chunk = data[i:i + width]
+            hex_part = ' '.join(f"{b:02X}" for b in chunk)
+            hex_part = hex_part.ljust(width * 3 - 1)
+            ascii_part = ''.join(chr(b) if 32 <= b < 127 else '.' for b in chunk)
+            lines.append(f"{i:08X}  {hex_part}  {ascii_part}")
+        return '\n'.join(lines)
+
+
 class DirCompareTool(QMainWindow):
     """主窗口"""
     def __init__(self):
@@ -706,8 +1171,15 @@ class DirCompareTool(QMainWindow):
         self.filtered_results = []
         self.compare_mode = CompareMode.ALL
         self.display_mode = DisplayMode.GROUP
+        self.compare_algorithm = CompareAlgorithm.BASIC
         self.history = []
         self.result_list = None 
+        self._start_maximized = False
+        # 设置实时自动保存（★ v6.1）：500ms 防抖单次定时器，控件变更后防抖写盘
+        self._settings_save_timer = QTimer(self)
+        self._settings_save_timer.setSingleShot(True)
+        self._settings_save_timer.setInterval(500)
+        self._settings_save_timer.timeout.connect(self.save_settings)
         self.init_ui()
         self.load_settings()
         self.setup_connections()
@@ -720,10 +1192,7 @@ class DirCompareTool(QMainWindow):
         # 设置图标
         if os.path.exists("icon.ico"):
             self.setWindowIcon(QIcon("icon.ico"))
-    
-        # 删除菜单栏创建 - 注释掉或删除这行
-        # self.create_menu_bar()
-    
+        
         # 创建中央部件
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -737,6 +1206,9 @@ class DirCompareTool(QMainWindow):
         # 创建目录选择区域
         self.create_dir_selection(main_layout)
         
+        # 创建比对模式选择区域
+        self.create_algorithm_selection(main_layout)
+        
         # 创建过滤和显示选项
         self.create_filter_options(main_layout)
         
@@ -746,134 +1218,43 @@ class DirCompareTool(QMainWindow):
         # 创建进度条和状态栏
         self.create_progress_and_status(main_layout)
 
-    def create_menu_bar(self):
-        """创建菜单栏"""
-        menubar = self.menuBar()
+    def create_algorithm_selection(self, parent_layout):
+        """创建比对模式选择区域"""
+        group = QGroupBox("比对模式")
+        layout = QHBoxLayout(group)
+        layout.setContentsMargins(10, 5, 10, 5)
         
-        # 文件菜单
-        file_menu = menubar.addMenu("文件")
+        layout.addWidget(QLabel("比对算法:"))
+        self.algorithm_combo = QComboBox()
+        for algo in CompareAlgorithm:
+            self.algorithm_combo.addItem(algo.value, algo)
+        self.algorithm_combo.setCurrentIndex(0)
+        layout.addWidget(self.algorithm_combo)
         
-        open_dir1_action = QAction("打开目录1", self)
-        open_dir1_action.triggered.connect(lambda: self.browse_directory(self.dir1_edit))
-        file_menu.addAction(open_dir1_action)
+        layout.addStretch()
         
-        open_dir2_action = QAction("打开目录2", self)
-        open_dir2_action.triggered.connect(lambda: self.browse_directory(self.dir2_edit))
-        file_menu.addAction(open_dir2_action)
+        # 添加提示标签
+        hint_label = QLabel("💡 哈希比对会读取文件内容，大文件时速度较慢")
+        hint_label.setStyleSheet("color: #7f8c8d; font-size: 10px;")
+        layout.addWidget(hint_label)
         
-        file_menu.addSeparator()
-        
-        exit_action = QAction("退出", self)
-        exit_action.setShortcut(QKeySequence("Ctrl+Q"))
-        exit_action.triggered.connect(self.close)
-        file_menu.addAction(exit_action)
-        
-        # 查看菜单 - 完善
-        view_menu = menubar.addMenu("查看")
-    
-        # 显示模式子菜单
-        display_mode_menu = view_menu.addMenu("显示模式")
-        
-        group_action = QAction("分组显示", self, checkable=True)
-        group_action.setChecked(True)
-        group_action.triggered.connect(lambda: self.change_display_mode(DisplayMode.GROUP))
-        display_mode_menu.addAction(group_action)
-        
-        flat_action = QAction("平铺显示", self, checkable=True)
-        flat_action.triggered.connect(lambda: self.change_display_mode(DisplayMode.FLAT))
-        display_mode_menu.addAction(flat_action)
-        
-        list_action = QAction("列表显示", self, checkable=True)
-        list_action.triggered.connect(lambda: self.change_display_mode(DisplayMode.LIST))
-        display_mode_menu.addAction(list_action)
-        
-        view_menu.addSeparator()
-        
-        # 过滤模式子菜单
-        filter_mode_menu = view_menu.addMenu("过滤模式")
-        
-        all_action = QAction("全部文件", self, checkable=True)
-        all_action.setChecked(True)
-        all_action.triggered.connect(lambda: self.change_filter_mode(CompareMode.ALL))
-        filter_mode_menu.addAction(all_action)
-        
-        common_action = QAction("只显示共同存在", self, checkable=True)
-        common_action.triggered.connect(lambda: self.change_filter_mode(CompareMode.COMMON_ONLY))
-        filter_mode_menu.addAction(common_action)
-        
-        diff_action = QAction("只显示差异", self, checkable=True)
-        diff_action.triggered.connect(lambda: self.change_filter_mode(CompareMode.DIFF_ONLY))
-        filter_mode_menu.addAction(diff_action)
-        
-        extra_action = QAction("只显示多出的文件", self, checkable=True)
-        extra_action.triggered.connect(lambda: self.change_filter_mode(CompareMode.EXTRA_ONLY))
-        filter_mode_menu.addAction(extra_action)
-        
-        missing_action = QAction("只显示缺少的文件", self, checkable=True)
-        missing_action.triggered.connect(lambda: self.change_filter_mode(CompareMode.MISSING_ONLY))
-        filter_mode_menu.addAction(missing_action)
-        
-        view_menu.addSeparator()
-        
-        # 工具栏显示/隐藏
-        show_toolbar_action = QAction("显示工具栏", self, checkable=True)
-        show_toolbar_action.setChecked(True)
-        show_toolbar_action.triggered.connect(self.toggle_toolbar)
-        view_menu.addAction(show_toolbar_action)
-        
-        # 状态栏显示/隐藏
-        show_statusbar_action = QAction("显示状态栏", self, checkable=True)
-        show_statusbar_action.setChecked(True)
-        show_statusbar_action.triggered.connect(self.toggle_statusbar)
-        view_menu.addAction(show_statusbar_action)
-        
-        view_menu.addSeparator()
-        
-        # 刷新
-        refresh_view_action = QAction("刷新", self)
-        refresh_view_action.setShortcut(QKeySequence("F5"))
-        refresh_view_action.triggered.connect(self.start_comparison)
-        view_menu.addAction(refresh_view_action)
-        
-        # 工具菜单
-        tools_menu = menubar.addMenu("工具")
-        
-        compare_action = QAction("开始比较", self)
-        compare_action.setShortcut(QKeySequence("F5"))
-        compare_action.triggered.connect(self.start_comparison)
-        tools_menu.addAction(compare_action)
-        
-        stop_action = QAction("停止比较", self)
-        stop_action.triggered.connect(self.stop_comparison)
-        tools_menu.addAction(stop_action)
-        
-        tools_menu.addSeparator()
-        
-        history_action = QAction("历史记录", self)
-        history_action.triggered.connect(self.show_history)
-        tools_menu.addAction(history_action)
-    
-        clear_action = QAction("清空目录", self)
-        clear_action.triggered.connect(self.clear_directories)
-        tools_menu.addAction(clear_action)
-    
-        # 帮助菜单
-        help_menu = menubar.addMenu("帮助")
-        
-        help_action = QAction("帮助", self)
-        help_action.setShortcut(QKeySequence("F1"))
-        help_action.triggered.connect(self.show_help)
-        help_menu.addAction(help_action)
-        
-        help_menu.addSeparator()
-        
-        about_action = QAction("关于", self)
-        about_action.triggered.connect(self.show_about)
-        help_menu.addAction(about_action)
-        
-        about_qt_action = QAction("关于Qt", self)
-        about_qt_action.triggered.connect(QApplication.aboutQt)
-        help_menu.addAction(about_qt_action)
+        parent_layout.addWidget(group)
+
+    def get_algorithm(self) -> CompareAlgorithm:
+        """获取当前选中的比对算法"""
+        data = self.algorithm_combo.currentData()
+        return data if data else CompareAlgorithm.BASIC
+
+    def get_hash_type(self) -> Optional[str]:
+        """获取当前哈希算法名称，基础比对返回 None"""
+        algo = self.get_algorithm()
+        if algo == CompareAlgorithm.BASIC:
+            return None
+        return algo.name  # MD5 / SHA1 / SHA256 / CRC32
+
+    def use_hash(self) -> bool:
+        """是否使用哈希比对"""
+        return self.get_hash_type() is not None
 
     def create_toolbar(self):
         """创建工具栏"""
@@ -897,19 +1278,16 @@ class DirCompareTool(QMainWindow):
         refresh_action = QAction("刷新", self)
         refresh_action.setShortcut(QKeySequence("F5"))
         toolbar.addAction(refresh_action)
-        # 添加信号连接
         refresh_action.triggered.connect(self.start_comparison)
         
         # 历史记录
         history_action = QAction("历史记录", self)
         toolbar.addAction(history_action)
-        # 添加信号连接
         history_action.triggered.connect(self.show_history)
         
         # 清空
         clear_action = QAction("清空", self)
         toolbar.addAction(clear_action)
-        # 添加信号连接
         clear_action.triggered.connect(self.clear_directories)
         
         toolbar.addSeparator()
@@ -918,16 +1296,12 @@ class DirCompareTool(QMainWindow):
         help_action = QAction("帮助", self)
         help_action.setShortcut(QKeySequence("F1"))
         toolbar.addAction(help_action)
-        # 添加信号连接
         help_action.triggered.connect(self.show_help)
         
         # 添加关于菜单
         about_action = QAction("关于", self)
         toolbar.addAction(about_action)
-        # 添加信号连接
         about_action.triggered.connect(self.show_about)
-        
-       
 
     def create_dir_selection(self, parent_layout):
         """创建目录选择区域"""
@@ -999,10 +1373,17 @@ class DirCompareTool(QMainWindow):
         
     def create_result_display(self, parent_layout):
         """创建结果显示区域"""
+        # 统计信息面板
+        self.stats_label = QLabel("")
+        self.stats_label.setStyleSheet(
+            "color: #2c3e50; background: #ecf0f1; padding: 4px 8px; border-radius: 4px;"
+        )
+        parent_layout.addWidget(self.stats_label)
+        
         self.result_tree = QTreeWidget()
         self.result_tree.setHeaderLabels([
             "文件名", "路径", "状态", "大小(目录1)", "大小(目录2)", 
-            "修改时间(目录1)", "修改时间(目录2)"
+            "修改时间(目录1)", "修改时间(目录2)", "MD5(目录1)", "MD5(目录2)"
         ])
         
         # 设置列宽
@@ -1054,6 +1435,58 @@ class DirCompareTool(QMainWindow):
         self.mode_combo.currentTextChanged.connect(self.filter_results)
         self.display_combo.currentTextChanged.connect(self.filter_results)
         
+        # 比对算法切换时的提示
+        self.algorithm_combo.currentIndexChanged.connect(self.on_algorithm_changed)
+        
+        # 设置实时自动保存（★ v6.1）：控件变更 → 防抖定时器 → save_settings
+        self.dir1_edit.textChanged.connect(self._autosave_settings)
+        self.dir2_edit.textChanged.connect(self._autosave_settings)
+        self.mode_combo.currentIndexChanged.connect(self._autosave_settings)
+        self.display_combo.currentIndexChanged.connect(self._autosave_settings)
+        self.algorithm_combo.currentIndexChanged.connect(self._autosave_settings)
+        
+    def _autosave_settings(self):
+        """触发防抖自动保存（★ v6.1）：500ms 内无操作才写盘"""
+        self._settings_save_timer.start()
+        
+    def on_algorithm_changed(self, index):
+        """比对算法改变时的处理"""
+        algo = self.get_algorithm()
+        is_hash = algo != CompareAlgorithm.BASIC
+        
+        if is_hash:
+            # 检查当前过滤模式
+            current_mode = list(CompareMode)[self.mode_combo.currentIndex()]
+            if current_mode == CompareMode.MD5_DIFF_ONLY:
+                QMessageBox.information(
+                    self, 
+                    "哈希比对模式",
+                    f"{algo.value}会读取所有文件内容计算哈希值，\n"
+                    "对于大文件或大量文件时可能会比较慢。\n"
+                    "建议在需要精确比对文件内容时使用。\n\n"
+                    "当前已选择'只显示MD5差异'过滤模式，切换后将显示哈希不同的文件。"
+                )
+            else:
+                QMessageBox.information(
+                    self, 
+                    "哈希比对模式",
+                    f"{algo.value}会读取所有文件内容计算哈希值，\n"
+                    "对于大文件或大量文件时可能会比较慢。\n"
+                    "建议在需要精确比对文件内容时使用。"
+                )
+        else:
+            # 切换到基础比对
+            current_mode = list(CompareMode)[self.mode_combo.currentIndex()]
+            if current_mode == CompareMode.MD5_DIFF_ONLY:
+                QMessageBox.information(
+                    self,
+                    "模式提示",
+                    "您切换到了基础比对模式，但当前过滤模式为'只显示MD5差异'。\n"
+                    "基础比对模式下，MD5差异过滤将不会显示任何结果。\n"
+                    "如需查看MD5差异，请切换回哈希比对模式。"
+                )
+                self.filter_results()
+        
     def browse_directory(self, line_edit):
         """浏览目录"""
         directory = QFileDialog.getExistingDirectory(
@@ -1079,7 +1512,7 @@ class DirCompareTool(QMainWindow):
             self.history.insert(0, path)
             if len(self.history) > 20:
                 self.history.pop()
-            self.save_settings()
+            self._autosave_settings()
             
     def start_comparison(self):
         """开始比较"""
@@ -1093,6 +1526,10 @@ class DirCompareTool(QMainWindow):
         if not os.path.isdir(dir1) or not os.path.isdir(dir2):
             QMessageBox.warning(self, "警告", "目录路径无效")
             return
+        
+        # 获取比对算法
+        use_md5 = self.use_hash()
+        hash_type = self.get_hash_type() or "MD5"
             
         # 更新UI状态
         self.start_action.setEnabled(False)
@@ -1100,9 +1537,11 @@ class DirCompareTool(QMainWindow):
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.result_tree.clear()
+        if hasattr(self, 'result_list') and self.result_list:
+            self.result_list.clear()
         
         # 启动扫描线程
-        self.scan_thread = ScanThread(dir1, dir2)
+        self.scan_thread = ScanThread(dir1, dir2, use_md5, hash_type)
         self.scan_thread.progress.connect(self.update_progress)
         self.scan_thread.finished.connect(self.on_scan_finished)
         self.scan_thread.error.connect(self.on_error)
@@ -1125,15 +1564,16 @@ class DirCompareTool(QMainWindow):
         """扫描完成"""
         self.scan_thread = None
         
-        # 检查是否有错误
-        errors = result.get('errors', [])
-        if errors:
-            QMessageBox.warning(self, "扫描警告", "\n".join(errors[:5]))
-            
+        # 获取比对算法
+        use_md5 = self.use_hash()
+        hash_type = self.get_hash_type() or "MD5"
+        
         # 启动比较线程
         self.compare_thread = CompareThread(
             result.get('files1', {}),
-            result.get('files2', {})
+            result.get('files2', {}),
+            use_md5,
+            hash_type
         )
         self.compare_thread.progress.connect(self.update_progress)
         self.compare_thread.finished.connect(self.on_compare_finished)
@@ -1144,9 +1584,38 @@ class DirCompareTool(QMainWindow):
         """比较完成"""
         self.compare_thread = None
         self.current_results = results
+        hash_type = self.get_hash_type()
+        
+        # 统计哈希比对结果
+        if hash_type:
+            same_count = sum(1 for r in results if r.get('is_same', False))
+            diff_count = sum(1 for r in results if r.get('in_dir1') and r.get('in_dir2') and not r.get('is_same', False))
+            total_common = sum(1 for r in results if r.get('in_dir1') and r.get('in_dir2'))
+            
+            # 如果当前选中的是MD5差异模式，但用户使用的是基础比对，给出提示
+            current_mode = list(CompareMode)[self.mode_combo.currentIndex()]
+            if current_mode == CompareMode.MD5_DIFF_ONLY and not hash_type:
+                self.status_label.setText(f"提示: '只显示MD5差异'模式需要配合哈希比对使用，当前为基础比对模式。共同文件: {total_common} 个")
+            else:
+                self.status_label.setText(f"{hash_type}比对完成: 相同 {same_count} 个, 不同 {diff_count} 个, 总计共同文件 {total_common} 个")
+        else:
+            self.filter_results()
+            self.status_label.setText(f"比较完成，共 {len(results)} 个项目")
+        
+        # 检查模式兼容性
+        current_mode = list(CompareMode)[self.mode_combo.currentIndex()]
+        if current_mode == CompareMode.MD5_DIFF_ONLY and not hash_type:
+            QMessageBox.information(
+                self,
+                "模式提示",
+                "您当前选择了'只显示MD5差异'过滤模式，但使用的是基础比对。\n"
+                "基础比对模式下，MD5差异过滤将不会显示任何结果。\n"
+                "如需查看MD5差异，请切换到哈希指纹比对模式后重新比较。"
+            )
+        
         self.filter_results()
+        self.update_stats()
         self.reset_ui_state()
-        self.status_label.setText(f"比较完成，共 {len(results)} 个项目")
         
     def filter_results(self):
         """过滤结果"""
@@ -1159,17 +1628,23 @@ class DirCompareTool(QMainWindow):
         for item in self.current_results:
             if mode == CompareMode.ALL:
                 self.filtered_results.append(item)
-            elif mode == CompareMode.COMMON_ONLY:  # 新增条件
+            elif mode == CompareMode.COMMON_ONLY:
                 if item['in_dir1'] and item['in_dir2']:
                     self.filtered_results.append(item)
             elif mode == CompareMode.DIFF_ONLY:
-                if item['in_dir1'] != item['in_dir2']:
+                # 差异：一边有另一边没有，或者两边都有但不相同（基础比对模式）
+                if (item['in_dir1'] != item['in_dir2']) or \
+                   (item['in_dir1'] and item['in_dir2'] and not item.get('is_same', True)):
                     self.filtered_results.append(item)
             elif mode == CompareMode.EXTRA_ONLY:
                 if item['in_dir1'] and not item['in_dir2']:
                     self.filtered_results.append(item)
             elif mode == CompareMode.MISSING_ONLY:
                 if not item['in_dir1'] and item['in_dir2']:
+                    self.filtered_results.append(item)
+            elif mode == CompareMode.MD5_DIFF_ONLY:
+                # MD5差异：两个目录都存在，但MD5值不同（只有在MD5模式下才有意义）
+                if item['in_dir1'] and item['in_dir2'] and not item.get('is_same', True):
                     self.filtered_results.append(item)
                     
         self.display_results()
@@ -1191,35 +1666,51 @@ class DirCompareTool(QMainWindow):
         elif display_mode == DisplayMode.FLAT:
             self.display_flat()
         elif display_mode == DisplayMode.LIST:
-            self.display_list() 
-            
-            
+            self.display_list()
+    
+    def get_hash_display(self) -> str:
+        """获取哈希显示名称（用于表头等）"""
+        return self.get_hash_type() or "MD5"
+
     def display_grouped(self):
         """分组显示"""
-        # 显示树形控件
         self.result_tree.setVisible(True)
         
-        # 如果列表控件存在，则隐藏它
         if hasattr(self, 'result_list') and self.result_list is not None:
             self.result_list.setVisible(False)
     
         # 恢复所有列的显示
-        self.result_tree.setHeaderLabels([
-            "文件名", "路径", "状态", "大小(目录1)", "大小(目录2)", 
-            "修改时间(目录1)", "修改时间(目录2)"
-        ])
-        for i in range(7):
-            self.result_tree.setColumnHidden(i, False)
+        use_md5 = self.use_hash()
+        ht = self.get_hash_display()
+        
+        if use_md5:
+            self.result_tree.setHeaderLabels([
+                "文件名", "路径", "状态", "大小(目录1)", "大小(目录2)", 
+                "修改时间(目录1)", "修改时间(目录2)", f"{ht}(目录1)", f"{ht}(目录2)"
+            ])
+            for i in range(9):
+                self.result_tree.setColumnHidden(i, False)
+        else:
+            self.result_tree.setHeaderLabels([
+                "文件名", "路径", "状态", "大小(目录1)", "大小(目录2)", 
+                "修改时间(目录1)", "修改时间(目录2)"
+            ])
+            for i in range(7):
+                self.result_tree.setColumnHidden(i, False)
         
         groups = {
-            "共同文件": [],
+            "共同文件(内容相同)": [],
+            "共同文件(内容不同)": [],
             "仅在目录1中": [],
             "仅在目录2中": []
         }
         
         for item in self.filtered_results:
             if item['in_dir1'] and item['in_dir2']:
-                groups["共同文件"].append(item)
+                if item.get('is_same', True):
+                    groups["共同文件(内容相同)"].append(item)
+                else:
+                    groups["共同文件(内容不同)"].append(item)
             elif item['in_dir1'] and not item['in_dir2']:
                 groups["仅在目录1中"].append(item)
             elif not item['in_dir1'] and item['in_dir2']:
@@ -1233,8 +1724,10 @@ class DirCompareTool(QMainWindow):
             group_item.setExpanded(True)
             
             # 设置组标题颜色
-            if group_name == "共同文件":
-                group_item.setBackground(0, COLOR_EXIST)
+            if group_name == "共同文件(内容相同)":
+                group_item.setBackground(0, COLOR_MD5_MATCH)
+            elif group_name == "共同文件(内容不同)":
+                group_item.setBackground(0, COLOR_MD5_MISMATCH)
             elif group_name == "仅在目录1中":
                 group_item.setBackground(0, COLOR_EXTRA)
             elif group_name == "仅在目录2中":
@@ -1243,26 +1736,82 @@ class DirCompareTool(QMainWindow):
             self.result_tree.addTopLevelItem(group_item)
             
             for item in items:
-                self.add_tree_item(group_item, item, DisplayMode.FLAT)
+                self.add_tree_item(group_item, item)
                 
     def display_flat(self):
-        """平铺显示 - 显示所有详细信息"""
-        # 显示树形控件
+        """平铺显示"""
         self.result_tree.setVisible(True)
         
-        # 如果列表控件存在，则隐藏它
         if hasattr(self, 'result_list') and self.result_list is not None:
             self.result_list.setVisible(False)
 
-        # 恢复所有列的显示
-        self.result_tree.setHeaderLabels([
-            "文件名", "路径", "状态", "大小(目录1)", "大小(目录2)", 
-            "修改时间(目录1)", "修改时间(目录2)"
-        ])
-        for i in range(7):
-            self.result_tree.setColumnHidden(i, False)
+        use_md5 = self.use_hash()
+        ht = self.get_hash_display()
+        
+        if use_md5:
+            self.result_tree.setHeaderLabels([
+                "文件名", "路径", "状态", "大小(目录1)", "大小(目录2)", 
+                "修改时间(目录1)", "修改时间(目录2)", f"{ht}(目录1)", f"{ht}(目录2)"
+            ])
+        else:
+            self.result_tree.setHeaderLabels([
+                "文件名", "路径", "状态", "大小(目录1)", "大小(目录2)", 
+                "修改时间(目录1)", "修改时间(目录2)"
+            ])
         
         for item in self.filtered_results:
+            if use_md5:
+                tree_item = QTreeWidgetItem([
+                    item['name'],
+                    item['rel_path'],
+                    self.get_status_text(item),
+                    self.format_size(item['size1']),
+                    self.format_size(item['size2']),
+                    self.format_time(item['time1']),
+                    self.format_time(item['time2']),
+                    item.get('md5_1', '-')[:8] + "..." if item.get('md5_1') else "-",
+                    item.get('md5_2', '-')[:8] + "..." if item.get('md5_2') else "-"
+                ])
+                col_count = 9
+            else:
+                tree_item = QTreeWidgetItem([
+                    item['name'],
+                    item['rel_path'],
+                    self.get_status_text(item),
+                    self.format_size(item['size1']),
+                    self.format_size(item['size2']),
+                    self.format_time(item['time1']),
+                    self.format_time(item['time2'])
+                ])
+                col_count = 7
+            
+            # 设置颜色
+            if item['in_dir1'] and item['in_dir2']:
+                if self.use_hash():
+                    if item.get('is_same', True):
+                        for i in range(col_count):
+                            tree_item.setBackground(i, COLOR_MD5_MATCH)
+                    else:
+                        for i in range(col_count):
+                            tree_item.setBackground(i, COLOR_MD5_MISMATCH)
+                else:
+                    for i in range(col_count):
+                        tree_item.setBackground(i, COLOR_EXIST)
+            elif item['in_dir1'] and not item['in_dir2']:
+                for i in range(col_count):
+                    tree_item.setBackground(i, COLOR_EXTRA)
+            elif not item['in_dir1'] and item['in_dir2']:
+                for i in range(col_count):
+                    tree_item.setBackground(i, COLOR_MISSING)
+            
+            self.result_tree.addTopLevelItem(tree_item)
+            
+    def add_tree_item(self, parent, item):
+        """添加树项目"""
+        use_md5 = self.use_hash()
+        ht = self.get_hash_display()
+        
+        if use_md5:
             tree_item = QTreeWidgetItem([
                 item['name'],
                 item['rel_path'],
@@ -1270,34 +1819,12 @@ class DirCompareTool(QMainWindow):
                 self.format_size(item['size1']),
                 self.format_size(item['size2']),
                 self.format_time(item['time1']),
-                self.format_time(item['time2'])
+                self.format_time(item['time2']),
+                item.get('md5_1', '-')[:8] + "..." if item.get('md5_1') else "-",
+                item.get('md5_2', '-')[:8] + "..." if item.get('md5_2') else "-"
             ])
-            
-            # 设置颜色 - 所有列都上色
-            if item['in_dir1'] and item['in_dir2']:
-                for i in range(7):
-                    tree_item.setBackground(i, COLOR_EXIST)
-            elif item['in_dir1'] and not item['in_dir2']:
-                for i in range(7):
-                    tree_item.setBackground(i, COLOR_EXTRA)
-            elif not item['in_dir1'] and item['in_dir2']:
-                for i in range(7):
-                    tree_item.setBackground(i, COLOR_MISSING)
-            
-            self.result_tree.addTopLevelItem(tree_item)
-            
-    def add_tree_item(self, parent, item, mode=DisplayMode.FLAT):
-        """添加树项目，支持不同的显示模式"""
-        if mode == DisplayMode.LIST:
-            # 列表模式只显示基本列
-            tree_item = QTreeWidgetItem([
-                item['name'],
-                item['rel_path'],
-                self.get_status_text(item)
-            ])
-            col_count = 3
+            col_count = 9
         else:
-            # 平铺模式显示所有列
             tree_item = QTreeWidgetItem([
                 item['name'],
                 item['rel_path'],
@@ -1311,8 +1838,16 @@ class DirCompareTool(QMainWindow):
         
         # 设置颜色
         if item['in_dir1'] and item['in_dir2']:
-            for i in range(col_count):
-                tree_item.setBackground(i, COLOR_EXIST)
+            if self.use_hash():
+                if item.get('is_same', True):
+                    for i in range(col_count):
+                        tree_item.setBackground(i, COLOR_MD5_MATCH)
+                else:
+                    for i in range(col_count):
+                        tree_item.setBackground(i, COLOR_MD5_MISMATCH)
+            else:
+                for i in range(col_count):
+                    tree_item.setBackground(i, COLOR_EXIST)
         elif item['in_dir1'] and not item['in_dir2']:
             for i in range(col_count):
                 tree_item.setBackground(i, COLOR_EXTRA)
@@ -1328,7 +1863,14 @@ class DirCompareTool(QMainWindow):
     def get_status_text(self, item) -> str:
         """获取状态文本"""
         if item['in_dir1'] and item['in_dir2']:
-            return "共同存在"
+            if self.use_hash():
+                ht = self.get_hash_display()
+                if item.get('is_same', True):
+                    return f"共同存在({ht}相同)"
+                else:
+                    return f"共同存在({ht}不同)"
+            else:
+                return "共同存在"
         elif item['in_dir1'] and not item['in_dir2']:
             return "仅在目录1"
         elif not item['in_dir1'] and item['in_dir2']:
@@ -1368,6 +1910,12 @@ class DirCompareTool(QMainWindow):
         copy_path_action = menu.addAction("复制路径")
         copy_name_action = menu.addAction("复制文件名")
         menu.addSeparator()
+        
+        if self.use_hash():
+            ht = self.get_hash_display()
+            calc_md5_action = menu.addAction(f"计算{ht}值")
+            menu.addSeparator()
+        
         compare_action = menu.addAction("比较内容")
         menu.addSeparator()
         refresh_action = menu.addAction("刷新")
@@ -1381,10 +1929,42 @@ class DirCompareTool(QMainWindow):
             self.copy_path(item)
         elif action == copy_name_action:
             self.copy_name(item)
+        elif self.use_hash() and action == calc_md5_action:
+            self.calculate_selected_md5(item)
+        elif action == compare_action:
+            self.compare_file_content(item)
             
+    def calculate_selected_md5(self, item):
+        """计算选中文件的MD5值"""
+        # 获取文件路径
+        path = item.text(1)  # 路径列
+        if path and path != "路径":
+            dir1 = self.dir1_edit.text()
+            dir2 = self.dir2_edit.text()
+            full_path = os.path.join(dir1, path) if os.path.exists(os.path.join(dir1, path)) else os.path.join(dir2, path)
+            
+            if os.path.exists(full_path) and os.path.isfile(full_path):
+                # 计算MD5
+                try:
+                    hash_md5 = hashlib.md5()
+                    with open(full_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(8192), b""):
+                            hash_md5.update(chunk)
+                    md5_value = hash_md5.hexdigest()
+                    
+                    QMessageBox.information(
+                        self, 
+                        "MD5计算结果",
+                        f"文件: {os.path.basename(full_path)}\nMD5: {md5_value}"
+                    )
+                except Exception as e:
+                    QMessageBox.warning(self, "错误", f"计算MD5失败: {str(e)}")
+            else:
+                QMessageBox.warning(self, "警告", "无法计算目录的MD5值")
+        
     def open_file_location(self, item):
         """打开文件位置"""
-        path = item.text(1)  # 路径列
+        path = item.text(1)
         if path and path != "路径":
             dir1 = self.dir1_edit.text()
             dir2 = self.dir2_edit.text()
@@ -1422,6 +2002,31 @@ class DirCompareTool(QMainWindow):
         self.stop_action.setEnabled(False)
         self.progress_bar.setVisible(False)
         
+    def update_stats(self):
+        """更新统计信息面板"""
+        if not self.current_results:
+            self.stats_label.setText("")
+            return
+            
+        same = sum(1 for r in self.current_results if r.get('in_dir1') and r.get('in_dir2') and r.get('is_same', True))
+        diff = sum(1 for r in self.current_results if r.get('in_dir1') and r.get('in_dir2') and not r.get('is_same', True))
+        only1 = sum(1 for r in self.current_results if r.get('in_dir1') and not r.get('in_dir2'))
+        only2 = sum(1 for r in self.current_results if not r.get('in_dir1') and r.get('in_dir2'))
+        
+        # 文件总大小统计（不含目录）
+        def file_size(r, key):
+            if r.get('is_dir'):
+                return 0
+            return r.get(key, 0) or 0
+        
+        size1 = sum(file_size(r, 'size1') for r in self.current_results if r.get('in_dir1'))
+        size2 = sum(file_size(r, 'size2') for r in self.current_results if r.get('in_dir2'))
+        
+        text = (f"📊 统计: 相同 {same} | 不同 {diff} | 仅目录1 {only1} | 仅目录2 {only2} | "
+                f"合计 {len(self.current_results)} 项 | "
+                f"目录1体积 {self.format_size(size1)} | 目录2体积 {self.format_size(size2)}")
+        self.stats_label.setText(text)
+        
     def load_settings(self):
         """加载设置"""
         # 加载历史记录
@@ -1440,23 +2045,44 @@ class DirCompareTool(QMainWindow):
         display_index = self.settings.value("display_index", 0, type=int)
         self.display_combo.setCurrentIndex(display_index)
         
-        # 加载窗口位置
+        # 加载比对算法设置（兼容旧版 use_md5）
+        algo_index = self.settings.value("algorithm_index", 0, type=int)
+        if not 0 <= algo_index < len(CompareAlgorithm):
+            algo_index = 0
+        use_md5 = self.settings.value("use_md5", False, type=bool)
+        if use_md5 and algo_index == 0:
+            algo_index = 1  # 旧版保存的是MD5
+        self.algorithm_combo.setCurrentIndex(algo_index)
+        
+        # 加载窗口位置与最大化状态
         geometry = self.settings.value("geometry")
         if geometry:
             self.restoreGeometry(geometry)
+        self._start_maximized = self.settings.value("window_maximized", False, type=bool)
             
     def save_settings(self):
-        """保存设置"""
+        """保存设置（立即写盘，供防抖定时器与退出时调用）"""
         self.settings.setValue("history", self.history)
         self.settings.setValue("last_dir1", self.dir1_edit.text())
         self.settings.setValue("last_dir2", self.dir2_edit.text())
         self.settings.setValue("mode_index", self.mode_combo.currentIndex())
         self.settings.setValue("display_index", self.display_combo.currentIndex())
+        self.settings.setValue("algorithm_index", self.algorithm_combo.currentIndex())
+        self.settings.setValue("use_md5", self.use_hash())
         self.settings.setValue("geometry", self.saveGeometry())
+        self.settings.setValue("window_maximized", self.isMaximized())
+        
+    def show_window(self):
+        """按保存的状态显示窗口（最大化/普通，★ v6.1）"""
+        if self._start_maximized:
+            self.showMaximized()
+        else:
+            self.show()
         
     def closeEvent(self, event):
         """关闭事件"""
-        self.save_settings()
+        self._settings_save_timer.stop()  # 停止防抖，避免退出后触发写盘
+        self.save_settings()              # 退出强制立即保存
         self.stop_comparison()
         event.accept()
 
@@ -1482,7 +2108,6 @@ class DirCompareTool(QMainWindow):
         if dialog.exec() == QDialog.Accepted:
             selected = dialog.get_selected()
             if selected:
-                # 可以选择将选中的历史记录填充到目录输入框
                 reply = QMessageBox.question(
                     self, 
                     "选择目录",
@@ -1495,6 +2120,185 @@ class DirCompareTool(QMainWindow):
                     self.dir1_edit.setText(selected)
                 elif reply == QMessageBox.No:
                     self.dir2_edit.setText(selected)
+
+    def show_sync_dialog(self):
+        """打开一键同步对话框"""
+        dir1 = self.dir1_edit.text().strip()
+        dir2 = self.dir2_edit.text().strip()
+        
+        if not dir1 or not dir2:
+            QMessageBox.warning(self, "警告", "请先选择两个目录")
+            return
+        if not os.path.isdir(dir1) or not os.path.isdir(dir2):
+            QMessageBox.warning(self, "警告", "目录路径无效")
+            return
+        if not self.current_results:
+            QMessageBox.information(self, "提示", "请先进行目录比较，再进行同步")
+            return
+        
+        dialog = SyncDialog(self, dir1, dir2, self.current_results)
+        dialog.exec()
+
+    def show_export(self):
+        """导出比较结果"""
+        if not self.current_results:
+            QMessageBox.information(self, "提示", "没有可导出的结果，请先进行目录比较")
+            return
+        
+        default_name = f"目录比较报告_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        path, selected_filter = QFileDialog.getSaveFileName(
+            self, "导出比较结果", default_name,
+            "HTML 报告 (*.html);;CSV 文件 (*.csv);;文本文件 (*.txt)"
+        )
+        if not path:
+            return
+        
+        try:
+            if 'HTML' in selected_filter or path.lower().endswith('.html'):
+                self.export_html(path)
+            elif 'CSV' in selected_filter or path.lower().endswith('.csv'):
+                self.export_csv(path)
+            else:
+                self.export_txt(path)
+            QMessageBox.information(self, "导出成功", f"报告已导出到:\n{path}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", f"导出时发生错误: {str(e)}")
+
+    def export_html(self, path: str):
+        """导出为HTML报告"""
+        ht = self.get_hash_display()
+        rows = []
+        for item in self.current_results:
+            status = self.get_status_text(item)
+            if item['in_dir1'] and item['in_dir2']:
+                color = '#A8E6CF' if item.get('is_same', True) else '#FFD3B6'
+            elif item['in_dir1']:
+                color = '#FFB7CE'
+            else:
+                color = '#FFDAC1'
+            md5_1 = item.get('md5_1') or '-'
+            md5_2 = item.get('md5_2') or '-'
+            rows.append(
+                f"<tr style='background-color: {color}'>"
+                f"<td>{self._esc(item['name'])}</td>"
+                f"<td>{self._esc(item['rel_path'])}</td>"
+                f"<td>{status}</td>"
+                f"<td>{self.format_size(item['size1'])}</td>"
+                f"<td>{self.format_size(item['size2'])}</td>"
+                f"<td>{self.format_time(item['time1'])}</td>"
+                f"<td>{self.format_time(item['time2'])}</td>"
+                f"<td>{self._esc(md5_1)}</td>"
+                f"<td>{self._esc(md5_2)}</td>"
+                f"</tr>"
+            )
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>目录比较报告</title>
+<style>
+body {{ font-family: 'Microsoft YaHei', sans-serif; margin: 20px; }}
+h1 {{ color: #2c3e50; }}
+table {{ border-collapse: collapse; width: 100%; }}
+th, td {{ border: 1px solid #ddd; padding: 6px 8px; text-align: left; }}
+th {{ background-color: #f2f2f2; }}
+</style>
+</head>
+<body>
+<h1>{self._esc(ProjectInfo.NAME)} - 目录比较报告</h1>
+<p>生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+<p>目录1: {self._esc(self.dir1_edit.text())}<br>目录2: {self._esc(self.dir2_edit.text())}</p>
+<p>比对算法: {self.get_algorithm().value} | 共 {len(self.current_results)} 个项目</p>
+<table>
+<tr><th>文件名</th><th>路径</th><th>状态</th><th>大小(目录1)</th><th>大小(目录2)</th><th>修改时间(目录1)</th><th>修改时间(目录2)</th><th>{ht}(目录1)</th><th>{ht}(目录2)</th></tr>
+{''.join(rows)}
+</table>
+</body>
+</html>"""
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(html)
+
+    def export_csv(self, path: str):
+        """导出为CSV文件"""
+        import csv
+        ht = self.get_hash_display()
+        with open(path, 'w', encoding='utf-8-sig', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(["文件名", "路径", "状态", "大小(目录1)", "大小(目录2)",
+                             "修改时间(目录1)", "修改时间(目录2)", f"{ht}(目录1)", f"{ht}(目录2)"])
+            for item in self.current_results:
+                writer.writerow([
+                    item['name'], item['rel_path'], self.get_status_text(item),
+                    self.format_size(item['size1']), self.format_size(item['size2']),
+                    self.format_time(item['time1']), self.format_time(item['time2']),
+                    item.get('md5_1') or '-', item.get('md5_2') or '-'
+                ])
+
+    def export_txt(self, path: str):
+        """导出为文本文件"""
+        lines = []
+        lines.append("=" * 70)
+        lines.append(f"{ProjectInfo.NAME} - 目录比较报告")
+        lines.append("=" * 70)
+        lines.append(f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"目录1: {self.dir1_edit.text()}")
+        lines.append(f"目录2: {self.dir2_edit.text()}")
+        lines.append(f"比对算法: {self.get_algorithm().value}")
+        lines.append(f"共 {len(self.current_results)} 个项目")
+        lines.append("=" * 70)
+        lines.append("")
+        
+        groups = {}
+        for item in self.current_results:
+            status = self.get_status_text(item)
+            groups.setdefault(status, []).append(item)
+        
+        for status, items in groups.items():
+            lines.append(f"【{status}】({len(items)}个)")
+            lines.append("-" * 70)
+            for item in items:
+                md5_info = ""
+                if item.get('md5_1') or item.get('md5_2'):
+                    md5_info = f"  哈希1: {item.get('md5_1') or '-'}  哈希2: {item.get('md5_2') or '-'}"
+                lines.append(
+                    f"  {item['name']} | {item['rel_path']} | "
+                    f"大小1:{self.format_size(item['size1'])} 大小2:{self.format_size(item['size2'])}"
+                    f"{md5_info}"
+                )
+            lines.append("")
+        
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+
+    @staticmethod
+    def _esc(text) -> str:
+        """HTML转义"""
+        return str(text).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+
+    def compare_file_content(self, item):
+        """比较树控件中选中文件的内容"""
+        path = item.text(1)
+        if not path or path == "路径":
+            QMessageBox.warning(self, "警告", "请选择有效的文件")
+            return
+        self._open_compare_dialog(path)
+
+    def compare_list_file_content(self, data):
+        """比较列表控件中选中文件的内容"""
+        if data and 'rel_path' in data:
+            self._open_compare_dialog(data['rel_path'])
+
+    def _open_compare_dialog(self, rel_path: str):
+        """打开文件内容对比对话框"""
+        dir1 = self.dir1_edit.text().strip()
+        dir2 = self.dir2_edit.text().strip()
+        p1 = os.path.join(dir1, rel_path)
+        p2 = os.path.join(dir2, rel_path)
+        if not (os.path.exists(p1) and os.path.exists(p2) and os.path.isfile(p1) and os.path.isfile(p2)):
+            QMessageBox.warning(self, "警告", "两个目录中均需存在该文件才能比较内容")
+            return
+        dialog = FileCompareDialog(p1, p2, self)
+        dialog.exec()
 
     def clear_directories(self):
         """清空目录输入框"""
@@ -1523,7 +2327,6 @@ class DirCompareTool(QMainWindow):
         self.dir1_edit.setText(dir2)
         self.dir2_edit.setText(dir1)
         
-        # 如果当前有结果显示，可以选择重新比较
         if self.current_results and dir1 and dir2:
             reply = QMessageBox.question(
                 self,
@@ -1553,35 +2356,25 @@ class DirCompareTool(QMainWindow):
         self.status_bar.setVisible(checked)
 
     def display_list(self):
-        """列表显示 - 类似资源管理器，根据窗口宽度自动调整列数"""
-        # 隐藏树形控件，显示列表控件
+        """列表显示"""
         self.result_tree.setVisible(False)
         
-        # 如果列表控件不存在，创建它
         if not hasattr(self, 'result_list') or self.result_list is None:
             self.result_list = QListWidget()
-            self.result_list.setViewMode(QListWidget.IconMode)  # 图标模式允许自动换行
-            self.result_list.setFlow(QListWidget.LeftToRight)   # 从左到右排列
-            self.result_list.setWrapping(True)                  # 自动换行
-            self.result_list.setResizeMode(QListWidget.Adjust)  # 调整大小时自动重新排列
-            self.result_list.setSpacing(5)                       # 设置间距
-            
-            # 设置统一的项目大小
-            self.result_list.setGridSize(QSize(150, 30))         # 设置网格大小
-            
-            # 设置选择模式
+            self.result_list.setViewMode(QListWidget.IconMode)
+            self.result_list.setFlow(QListWidget.LeftToRight)
+            self.result_list.setWrapping(True)
+            self.result_list.setResizeMode(QListWidget.Adjust)
+            self.result_list.setSpacing(5)
+            self.result_list.setGridSize(QSize(150, 30))
             self.result_list.setSelectionMode(QListWidget.ExtendedSelection)
-            
-            # 启用右键菜单
             self.result_list.setContextMenuPolicy(Qt.CustomContextMenu)
             self.result_list.customContextMenuRequested.connect(self.show_list_context_menu)
             
-            # 将列表控件添加到布局中（放在树形控件的位置）
             layout = self.centralWidget().layout()
             index = layout.indexOf(self.result_tree)
             layout.insertWidget(index, self.result_list)
         
-        # 清空列表
         self.result_list.clear()
         
         for item in self.filtered_results:
@@ -1589,21 +2382,22 @@ class DirCompareTool(QMainWindow):
             
             # 设置背景色
             if item['in_dir1'] and item['in_dir2']:
-                list_item.setBackground(COLOR_EXIST)
+                if self.use_hash():
+                    if item.get('is_same', True):
+                        list_item.setBackground(COLOR_MD5_MATCH)
+                    else:
+                        list_item.setBackground(COLOR_MD5_MISMATCH)
+                else:
+                    list_item.setBackground(COLOR_EXIST)
             elif item['in_dir1'] and not item['in_dir2']:
                 list_item.setBackground(COLOR_EXTRA)
             elif not item['in_dir1'] and item['in_dir2']:
                 list_item.setBackground(COLOR_MISSING)
             
-            # 存储完整数据供右键菜单使用
             list_item.setData(Qt.UserRole, item)
-            
-            # 设置文本对齐方式
             list_item.setTextAlignment(Qt.AlignCenter)
-            
             self.result_list.addItem(list_item)
         
-        # 显示列表控件，隐藏树形控件
         self.result_list.setVisible(True)
         self.result_tree.setVisible(False)
 
@@ -1615,26 +2409,28 @@ class DirCompareTool(QMainWindow):
         """显示列表控件的右键菜单"""
         menu = QMenu()
         
-        # 获取当前选中项
         item = self.result_list.currentItem()
         if not item:
             return
         
-        # 获取存储的完整数据
         data = item.data(Qt.UserRole)
         if not data:
             return
         
-        # 添加菜单项
         open_action = menu.addAction("打开文件位置")
         copy_path_action = menu.addAction("复制路径")
         copy_name_action = menu.addAction("复制文件名")
         menu.addSeparator()
+        
+        if self.use_hash():
+            ht = self.get_hash_display()
+            calc_md5_action = menu.addAction(f"计算{ht}值")
+            menu.addSeparator()
+        
         compare_action = menu.addAction("比较内容")
         menu.addSeparator()
         refresh_action = menu.addAction("刷新")
         
-        # 显示菜单
         action = menu.exec_(self.result_list.viewport().mapToGlobal(position))
         
         if action == open_action:
@@ -1643,6 +2439,33 @@ class DirCompareTool(QMainWindow):
             self.copy_list_path(data)
         elif action == copy_name_action:
             self.copy_list_name(data)
+        elif self.use_hash() and action == calc_md5_action:
+            self.calculate_list_md5(data)
+        elif action == compare_action:
+            self.compare_list_file_content(data)
+
+    def calculate_list_md5(self, data):
+        """计算列表项的MD5值"""
+        if data and 'rel_path' in data:
+            dir1 = self.dir1_edit.text()
+            dir2 = self.dir2_edit.text()
+            full_path = os.path.join(dir1, data['rel_path']) if os.path.exists(os.path.join(dir1, data['rel_path'])) else os.path.join(dir2, data['rel_path'])
+            
+            if os.path.exists(full_path) and os.path.isfile(full_path):
+                try:
+                    hash_md5 = hashlib.md5()
+                    with open(full_path, "rb") as f:
+                        for chunk in iter(lambda: f.read(8192), b""):
+                            hash_md5.update(chunk)
+                    md5_value = hash_md5.hexdigest()
+                    
+                    QMessageBox.information(
+                        self, 
+                        "MD5计算结果",
+                        f"文件: {os.path.basename(full_path)}\nMD5: {md5_value}"
+                    )
+                except Exception as e:
+                    QMessageBox.warning(self, "错误", f"计算MD5失败: {str(e)}")
 
     def open_list_file_location(self, data):
         """打开列表项的文件位置"""
@@ -1666,19 +2489,15 @@ class DirCompareTool(QMainWindow):
             clipboard.setText(data['name'])
 
 
-
-
-
 def main():
     app = QApplication(sys.argv)
     app.setStyle('Fusion')
     
-    # 设置中文字体
     font = QFont("Microsoft YaHei", 9)
     app.setFont(font)
     
     window = DirCompareTool()
-    window.show()
+    window.show_window()
     
     sys.exit(app.exec())
 
